@@ -18,12 +18,12 @@
 这样订阅进程才能正确接收共享行情，并实现多账户交易。
 
 ---
-## 0.修改 vnpy\event\__init__.py
+## 1.修改 vnpy\event\__init__.py
 ```python
 from rust_event_engine import EVENT_TIMER, Event, EventEngine,MmapPublisher,MmapSubscriber
 ```
 
-## 1. 修改 `utility.py`
+## 2. 修改 `utility.py`
 
 在 `utility.py` 中新增以下两个函数：
 
@@ -130,7 +130,7 @@ from typing import Callable, List
 
 ---
 
-## 2. 修改 `vnpy/trader/engine.py`
+## 3. 修改 `vnpy/trader/engine.py`
 
 修改 `connect` 方法，使其支持传入账户参数 `log_account`。
 
@@ -150,11 +150,13 @@ def connect(self, gateway_name: str, log_account: dict = {}):
 
 ---
 
-## 3. 修改 `hyperliquid_gateway.py`
+## 4. 修改 `hyperliquid_gateway.py`
 
 修改交易所接口 `connect` 方法，使其可以使用外部传入的账户参数。
 
 ```python
+from vnpy.trader.setting import hyperliquid_account_main  # 导入账户字典
+
 def connect(self, log_account: dict = {}) -> None:
     """
     连接交易接口。
