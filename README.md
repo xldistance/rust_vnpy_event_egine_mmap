@@ -1,3 +1,5 @@
+## 更多的utility函数可以从https://github.com/xldistance/vnpy_private_utility获取
+
 ````markdown
 # 多账户交易与共享内存行情订阅改造说明
 
