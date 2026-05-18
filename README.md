@@ -208,5 +208,3 @@ portfolio_trade_hyperliquid_tradfi.py
 3. `EventEngine` 可以接收共享内存中的 `eTick.` 事件。
 4. `connect` 方法支持传入不同账户参数。
 5. 可以实现 Hyperliquid 多账户交易。
-
-```
