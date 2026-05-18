@@ -18,6 +18,10 @@
 这样订阅进程才能正确接收共享行情，并实现多账户交易。
 
 ---
+## 0.修改 vnpy\event\__init__.py
+```python
+from rust_event_engine import EVENT_TIMER, Event, EventEngine,MmapPublisher,MmapSubscriber
+```
 
 ## 1. 修改 `utility.py`
 
