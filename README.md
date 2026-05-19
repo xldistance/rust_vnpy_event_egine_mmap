@@ -1,5 +1,5 @@
 ## 更多的utility函数:https://github.com/xldistance/vnpy_private_utility
-
+## 发布进程和订阅进程history_status和publish_status的用法参考:https://github.com/xldistance/vnpy_hyperliquid
 ````markdown
 # 多账户交易与共享内存行情订阅改造说明
 
