@@ -53,8 +53,9 @@ def run_child_process() -> None:
 
     write_log(f"启动 CLI 交易子进程，file_name='{file_name}'，is_subscription_client={is_subscription_client}")
 
+    # 只有发布进程下载分钟bar数据，订阅行情数据，发布进程和订阅进程都必须获取合约数据，有的交易所发送委托单需要合约数据
     for gateway in GATEWAYS:
-        main_engine.add_gateway(gateway, history_status, book_trade_status=False)
+        main_engine.add_gateway(gateway, history_status=history_status,publish_status=history_status, book_trade_status=False)
 
     GATEWAY_NAMES = list(main_engine.gateways)
     save_redis_data(f"{file_name}", GATEWAY_NAMES)
@@ -84,9 +85,11 @@ def run_child_process() -> None:
         sleep(10)
         write_log(f"交易接口：{gateway_name} 连接成功")
 
-    # 发布端进程订阅合约和记录行情（仅 _main 进程）
+    # 发布进程和订阅进程都必须调用subscribe_contract订阅合约(委托成交订阅也在subscribe函数里面，订阅进程不调用subscribe_contract则无法获取委托成交数据)，
+    # 订阅行情过滤由交易接口执行
+    main_engine.subscribe_contract()
+    # 发布进程写入行情到本地（仅 _main 进程）
     if not is_subscription_client:
-        main_engine.subscribe_contract()
         data_recorder: RecorderEngine = main_engine.add_app(DataRecorderApp)
         data_recorder.load_setting(GATEWAY_NAMES)
         write_log("添加行情记录 App")
