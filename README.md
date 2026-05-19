@@ -137,6 +137,39 @@ from typing import Callable, List
 修改 `connect` 方法，使其支持传入账户参数 `log_account`。
 
 ```python
+    def add_gateway(self, gateway_class: Type[BaseGateway], history_status: bool = True,publish_status:bool = True,book_trade_status:bool = False):
+        """
+        添加并初始化一个交易接口实例，配置其历史数据下载状态和逐笔成交数据订阅状态。
+
+        参数:
+            gateway_class (Type[BaseGateway]): 要添加的交易接口的类，此类必须继承自BaseGateway。
+            history_status (bool, 可选): 指定是否下载历史数据。默认为True，即下载历史数据和合约信息。
+            publish_status (bool, 可选): 识别mmap发布进程用于订阅行情数据。默认为True，即订阅行情数据
+            book_trade_status (bool, 可选): 指定是否订阅逐笔成交数据。默认为False，即不订阅逐笔成交数据。
+
+        返回:
+            创建并配置的交易接口实例。
+        """
+        # 创建交易接口实例
+        gateway = gateway_class(self.event_engine)
+
+        # 如果交易接口有历史数据下载状态属性，则设置其值
+        if hasattr(gateway, "history_status"):
+            gateway.history_status = history_status
+        if hasattr(gateway, "publish_status"):
+            gateway.publish_status = publish_status
+        # 如果交易接口有逐笔成交数据订阅属性，则设置其值
+        if hasattr(gateway, "book_trade_status"):
+            gateway.book_trade_status = book_trade_status
+        # 将交易接口添加到交易接口字典中
+        self.gateways[gateway.gateway_name] = gateway
+
+        for exchange in gateway.exchanges:
+            if exchange not in self.exchanges:
+                self.exchanges.append(exchange)
+
+        return gateway
+
 def connect(self, gateway_name: str, log_account: dict = {}):
     """
     连接交易接口。
