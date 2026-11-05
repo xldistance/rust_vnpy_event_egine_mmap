@@ -19,11 +19,11 @@
 */
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     path::PathBuf,
     sync::{
-        Arc, Mutex, Once,
+        Arc, Mutex, Once, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
@@ -166,14 +166,82 @@ const IDLE_REOPEN_CHECKS: u32 =
 const WRITE_LOCK_BACKOFF_US: u64 = POLL_FAST_US / 2;
 const SHM_MAX_NAME: usize = 31;
 
+// 不等待凑批；同时限制条数与持有 GIL 的时间，避免吞吐优化饿死其它 Python 线程。
+const PROCESS_BATCH_LIMIT: usize = 32;
+const PROCESS_GIL_BUDGET: Duration = Duration::from_micros(250);
+// 有界批量发布，避免一次调用占用过多内存或长时间垄断共享内存写锁。
+const MAX_PUBLISH_BATCH: usize = 256;
+
 type HandlerVec = Vec<Py<PyAny>>;
-type HandlerMap = HashMap<String, HandlerVec>;
+// 读路径只克隆 Arc；注册/注销时复制 Python 引用，保持回调中的快照语义。
+type HandlerMap = HashMap<String, Arc<HandlerVec>>;
 type SharedHandlerMap = Arc<Mutex<HandlerMap>>;
-type SharedHandlerVec = Arc<Mutex<HandlerVec>>;
-type EventSender = Sender<Vec<u8>>;
+type SharedHandlerVec = Arc<Mutex<Arc<HandlerVec>>>;
+
+const SUBSCRIBER_BATCH_LIMIT: usize = 64;
+
+enum EventPacket {
+    Single(Vec<u8>),
+    Batch(Vec<Vec<u8>>),
+}
+
+impl EventPacket {
+    fn append_to(self, pending: &mut VecDeque<Vec<u8>>) {
+        match self {
+            Self::Single(raw) => pending.push_back(raw),
+            Self::Batch(batch) => pending.extend(batch),
+        }
+    }
+}
+
+type EventSender = Sender<EventPacket>;
 type SharedSenderSlot = Arc<Mutex<Option<EventSender>>>;
 
 static LOGGER_INIT: Once = Once::new();
+
+// 仅含 Rust 线程句柄，不保存 Python 对象；弱引用避免总线名称永久占用注册表。
+static LOCAL_WAKES: OnceLock<Mutex<HashMap<String, Weak<LocalWake>>>> = OnceLock::new();
+
+#[derive(Default)]
+struct LocalWake {
+    publishers: AtomicU32,
+    subscribers: Mutex<Vec<Weak<thread::Thread>>>,
+}
+
+impl LocalWake {
+    fn notify(&self) {
+        if let Ok(mut threads) = self.subscribers.lock() {
+            threads.retain(|weak| {
+                if let Some(thread) = weak.upgrade() {
+                    // park/unpark 的 token 可合并且不会丢失“检查后、睡眠前”的通知。
+                    thread.unpark();
+                    true
+                } else { false }
+            });
+        }
+    }
+
+    fn pause(&self, duration: Duration) {
+        if self.publishers.load(Ordering::Acquire) > 0 {
+            thread::park_timeout(duration);
+        } else {
+            // 纯跨进程订阅保持原有微秒 sleep，不依赖本进程通知。
+            thread::sleep(duration);
+        }
+    }
+}
+
+fn local_wake(name: &str) -> Arc<LocalWake> {
+    let mut registry = LOCAL_WAKES.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.retain(|_, wake| wake.strong_count() > 0);
+    if let Some(existing) = registry.get(name).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let wake = Arc::new(LocalWake::default());
+    registry.insert(name.to_owned(), Arc::downgrade(&wake));
+    wake
+}
 
 /// 初始化一次性的错误日志记录器，确保后台线程中的异常可见。
 fn init_error_logger() {
@@ -440,22 +508,41 @@ fn is_publisher_closed_error(message: &str) -> bool {
         || message.contains("共享内存发布通道已关闭")
 }
 
-/// 使用 Python `pickle.dumps` 将对象序列化为字节流。
-fn py_serialize(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-    py.import("pickle")
-        .map_err(|e| PyRuntimeError::new_err(format!("导入 pickle 失败: {e}")))?
-        .call_method1("dumps", (obj, 5_u8))
-        .map_err(|e| PyRuntimeError::new_err(format!("pickle.dumps 失败: {e}")))?
-        .extract::<Vec<u8>>()
-        .map_err(|e| PyRuntimeError::new_err(format!("提取 pickle 字节失败: {e}")))
+/// 缓存所属引擎/发布器的序列化函数，而不是每条事件重新导入和查找属性。
+///
+/// 引用随实例持有，不把 Python 对象放到跨解释器的全局 static 中。
+/// 事件仍逐条独立序列化，保留原有本地快照及跨进程 pickle 协议。
+struct PickleCodec {
+    dumps: Py<PyAny>,
+    loads: Py<PyAny>,
 }
 
-/// 使用 Python `pickle.loads` 将字节流恢复为 Python 对象。
-fn py_deserialize<'py>(py: Python<'py>, raw: &[u8]) -> PyResult<Bound<'py, PyAny>> {
-    py.import("pickle")
-        .map_err(|e| PyRuntimeError::new_err(format!("导入 pickle 失败: {e}")))?
-        .call_method1("loads", (PyBytes::new(py, raw),))
-        .map_err(|e| PyRuntimeError::new_err(format!("pickle.loads 失败: {e}")))
+impl PickleCodec {
+    fn new(py: Python<'_>) -> PyResult<Self> {
+        let pickle = py
+            .import("pickle")
+            .map_err(|e| PyRuntimeError::new_err(format!("导入 pickle 失败: {e}")))?;
+        Ok(Self {
+            dumps: pickle.getattr("dumps")?.unbind(),
+            loads: pickle.getattr("loads")?.unbind(),
+        })
+    }
+
+    fn serialize(&self, py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+        let raw = self.dumps.bind(py)
+            .call1((obj, 5_u8))
+            .map_err(|e| PyRuntimeError::new_err(format!("pickle.dumps 失败: {e}")))?;
+        // 明确要求 pickle 返回 bytes，并单次复制其连续缓冲区。
+        let bytes = raw.cast::<PyBytes>()
+            .map_err(|e| PyRuntimeError::new_err(format!("提取 pickle 字节失败: {e}")))?;
+        Ok(bytes.as_bytes().to_vec())
+    }
+
+    fn deserialize<'py>(&self, py: Python<'py>, raw: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+        self.loads.bind(py)
+            .call1((PyBytes::new(py, raw),))
+            .map_err(|e| PyRuntimeError::new_err(format!("pickle.loads 失败: {e}")))
+    }
 }
 
 /// 校验给定 Python 对象是否可调用。
@@ -480,6 +567,9 @@ fn is_handler_lifecycle_error(message: &str) -> bool {
 
 /// 从事件对象的 `type_` 属性或映射键中提取事件类型。
 fn extract_type(event: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok(native) = event.cast::<Event>() {
+        return Ok(native.try_borrow()?.type_.clone());
+    }
     if let Ok(value) = event.getattr("type_") {
         return value
             .extract::<String>()
@@ -497,27 +587,28 @@ fn extract_type(event: &Bound<'_, PyAny>) -> PyResult<String> {
     ))
 }
 
-fn clone_handler_list(py: Python<'_>, handlers: &SharedHandlerMap, type_: &str) -> Vec<Py<PyAny>> {
+fn clone_handler_list(handlers: &SharedHandlerMap, type_: &str) -> Arc<HandlerVec> {
     match handlers.lock() {
-        Ok(map) => map
-            .get(type_)
-            .map(|items| items.iter().map(|item| item.clone_ref(py)).collect())
-            .unwrap_or_default(),
+        Ok(map) => map.get(type_).cloned().unwrap_or_default(),
         Err(e) => {
             error!("[EventEngine] handler 锁失败: {e}");
-            Vec::new()
+            Arc::default()
         }
     }
 }
 
-fn clone_general_handlers(py: Python<'_>, handlers: &SharedHandlerVec) -> Vec<Py<PyAny>> {
+fn clone_general_handlers(handlers: &SharedHandlerVec) -> Arc<HandlerVec> {
     match handlers.lock() {
-        Ok(items) => items.iter().map(|item| item.clone_ref(py)).collect(),
+        Ok(items) => Arc::clone(&items),
         Err(e) => {
             error!("[EventEngine] general handler 锁失败: {e}");
-            Vec::new()
+            Arc::default()
         }
     }
+}
+
+fn copy_handlers(py: Python<'_>, handlers: &[Py<PyAny>]) -> HandlerVec {
+    handlers.iter().map(|handler| handler.clone_ref(py)).collect()
 }
 
 fn remove_specific_handler_by_identity(
@@ -531,8 +622,11 @@ fn remove_specific_handler_by_identity(
         Ok(mut map) => {
             let mut should_remove_type = false;
             if let Some(items) = map.get_mut(type_) {
-                items.retain(|item| item.bind(py).as_ptr() != target_ptr);
-                should_remove_type = items.is_empty();
+                let next = items.iter()
+                    .filter(|item| item.bind(py).as_ptr() != target_ptr)
+                    .map(|item| item.clone_ref(py)).collect::<HandlerVec>();
+                should_remove_type = next.is_empty();
+                *items = Arc::new(next);
             }
             if should_remove_type {
                 map.remove(type_);
@@ -549,7 +643,11 @@ fn remove_general_handler_by_identity(
 ) {
     let target_ptr = target.bind(py).as_ptr();
     match handlers.lock() {
-        Ok(mut items) => items.retain(|item| item.bind(py).as_ptr() != target_ptr),
+        Ok(mut items) => {
+            *items = Arc::new(items.iter()
+                .filter(|item| item.bind(py).as_ptr() != target_ptr)
+                .map(|item| item.clone_ref(py)).collect());
+        }
         Err(e) => error!("[EventEngine] 注销失效 general handler 锁失败: {e}"),
     }
 }
@@ -575,12 +673,12 @@ fn dispatch_event_isolated(
         }
     };
 
-    let specific_handlers = clone_handler_list(py, handlers, &type_);
-    for handler in specific_handlers {
+    let specific_handlers = clone_handler_list(handlers, &type_);
+    for handler in specific_handlers.iter() {
         if let Err(e) = handler.call1(py, (event,)) {
             let error_text = e.to_string();
             if is_handler_lifecycle_error(&error_text) {
-                remove_specific_handler_by_identity(py, handlers, &type_, &handler);
+                remove_specific_handler_by_identity(py, handlers, &type_, handler);
                 // error!(
                 //     "[EventEngine] handler 生命周期已结束，已自动注销 type={type_}: {error_text}"
                 // );
@@ -590,12 +688,13 @@ fn dispatch_event_isolated(
         }
     }
 
-    let general = clone_general_handlers(py, general_handlers);
-    for handler in general {
+    // 通用快照仍在类型处理器执行之后取得，保留当次回调注册通用处理器的行为。
+    let general = clone_general_handlers(general_handlers);
+    for handler in general.iter() {
         if let Err(e) = handler.call1(py, (event,)) {
             let error_text = e.to_string();
             if is_handler_lifecycle_error(&error_text) {
-                remove_general_handler_by_identity(py, general_handlers, &handler);
+                remove_general_handler_by_identity(py, general_handlers, handler);
                 // error!("[EventEngine] general_handler 生命周期已结束，已自动注销: {error_text}");
             } else {
                 error!("[EventEngine] general_handler 异常: {error_text}");
@@ -1195,7 +1294,7 @@ fn call_disconnect_callback(callback: &Option<Py<PyAny>>) {
 }
 
 /// 将原始事件推送到本地处理队列；若通道失效则自动清理发送端缓存。
-fn forward_raw_event(sender_slot: &SharedSenderSlot, raw: Vec<u8>) -> bool {
+fn forward_raw_events(sender_slot: &SharedSenderSlot, batch: Vec<Vec<u8>>) -> bool {
     let sender = match sender_slot.lock() {
         Ok(guard) => guard.clone(),
         Err(e) => {
@@ -1208,7 +1307,7 @@ fn forward_raw_event(sender_slot: &SharedSenderSlot, raw: Vec<u8>) -> bool {
         return false;
     };
 
-    if sender.send(raw).is_err() {
+    if sender.send(EventPacket::Batch(batch)).is_err() {
         if let Ok(mut guard) = sender_slot.lock() {
             guard.take();
         }
@@ -1316,6 +1415,11 @@ fn poll_loop(
     let mut idle_reopen_count = 0_u32;
     let mut warned_no_sender = false;
     let mut last_subscriber_heartbeat = Instant::now();
+    let local_wake = local_wake(&shm_name);
+    let current_thread = Arc::new(thread::current());
+    if let Ok(mut subscribers) = local_wake.subscribers.lock() {
+        subscribers.push(Arc::downgrade(&current_thread));
+    }
 
     while active.load(Ordering::Acquire) {
         if shmem.is_none() {
@@ -1420,12 +1524,17 @@ fn poll_loop(
 
             let mut missed_slots = 0_u64;
             let mut forward_failed = 0_u64;
+            let mut batch = Vec::with_capacity(SUBSCRIBER_BATCH_LIMIT);
             let mut next_seq = start_seq;
             while next_seq <= write_seq {
                 match read_slot(buffer, next_seq) {
                     Some(raw) => {
-                        if !forward_raw_event(&sender_slot, raw) {
-                            forward_failed = forward_failed.saturating_add(1);
+                        batch.push(raw);
+                        if batch.len() == SUBSCRIBER_BATCH_LIMIT {
+                            let ready = std::mem::replace(&mut batch, Vec::with_capacity(SUBSCRIBER_BATCH_LIMIT));
+                            if !forward_raw_events(&sender_slot, ready) {
+                                forward_failed = forward_failed.saturating_add(SUBSCRIBER_BATCH_LIMIT as u64);
+                            }
                         }
                     }
                     None => {
@@ -1437,6 +1546,13 @@ fn poll_loop(
                     break;
                 }
                 next_seq = next_seq.saturating_add(1);
+            }
+
+            if !batch.is_empty() {
+                let count = batch.len() as u64;
+                if !forward_raw_events(&sender_slot, batch) {
+                    forward_failed = forward_failed.saturating_add(count);
+                }
             }
 
             if missed_slots > 0 {
@@ -1457,16 +1573,16 @@ fn poll_loop(
             }
 
             read_seq = write_seq;
-            thread::sleep(Duration::from_micros(POLL_FAST_US));
+            local_wake.pause(Duration::from_micros(POLL_FAST_US));
         } else {
             idle_count = idle_count.saturating_add(1);
             if idle_count >= IDLE_THRESH_FAST + IDLE_THRESH_MED {
-                thread::sleep(Duration::from_millis(POLL_IDLE_MS));
+                local_wake.pause(Duration::from_millis(POLL_IDLE_MS));
                 idle_reopen_count = idle_reopen_count.saturating_add(1);
             } else if idle_count >= IDLE_THRESH_FAST {
-                thread::sleep(Duration::from_micros(POLL_MED_US));
+                local_wake.pause(Duration::from_micros(POLL_MED_US));
             } else {
-                thread::sleep(Duration::from_micros(POLL_FAST_US));
+                local_wake.pause(Duration::from_micros(POLL_FAST_US));
             }
 
             if idle_reopen_count >= IDLE_REOPEN_CHECKS {
@@ -1585,20 +1701,12 @@ impl Event {
 }
 
 /// 根据类型与负载构造 [`Event`]，并序列化为可跨线程传输的字节流。
-fn serialize_event_from_parts(py: Python<'_>, type_: &str, data: Py<PyAny>) -> PyResult<Vec<u8>> {
+fn serialize_event_from_parts(
+    py: Python<'_>, codec: &PickleCodec, type_: &str, data: Py<PyAny>,
+) -> PyResult<Vec<u8>> {
     let event = Py::new(py, Event::new_owned(type_.to_string(), data))
         .map_err(|e| PyRuntimeError::new_err(format!("构造 Event 失败: {e}")))?;
-    py_serialize(py, event.bind(py).as_any())
-}
-
-enum PublisherCommand {
-    Publish {
-        payload: Vec<u8>,
-        ack: Sender<Result<(), String>>,
-    },
-    Close {
-        ack: Sender<()>,
-    },
+    codec.serialize(py, event.bind(py).as_any())
 }
 
 /// 将序列化后的事件负载写入共享内存环形槽位，并推进全局写指针。
@@ -1627,6 +1735,12 @@ fn write_payload_to_shmem(
 
     let current = load_u64_atomic(buf, H_WRITE_SEQ, Ordering::Acquire)
         .map_err(|e| format!("读取写指针失败: {e}"))?;
+    *write_seq = write_slot_locked(buf, current, payload)?;
+    Ok(())
+}
+
+/// 调用方持有跨进程写锁；每个槽位继续单独发布，兼容旧订阅器。
+fn write_slot_locked(buf: &mut [u8], current: u64, payload: &[u8]) -> Result<u64, String> {
     let seq = current
         .checked_add(1)
         .ok_or_else(|| "写序号溢出".to_string())?;
@@ -1663,118 +1777,93 @@ fn write_payload_to_shmem(
     // 最后推进全局写指针，保证订阅端不会在槽位发布前看到新 write_seq。
     store_u64_atomic(buf, H_WRITE_SEQ, seq, Ordering::Release)?;
 
-    *write_seq = seq;
+    Ok(seq)
+}
+
+fn write_batch_to_shmem(mapping: &mut PublisherMapping, payloads: &[Vec<u8>]) -> Result<(), String> {
+    let buf = shmem_slice_mut(&mut mapping.shmem)?;
+    let _guard = acquire_shmem_write_lock(buf)?;
+    update_client_heartbeat_locked(buf, &mapping.client)?;
+    let mut seq = load_u64_atomic(buf, H_WRITE_SEQ, Ordering::Acquire)?;
+    seq.checked_add(payloads.len() as u64).ok_or_else(|| "写序号溢出".to_string())?;
+    for payload in payloads {
+        seq = write_slot_locked(buf, seq, payload)?;
+    }
+    mapping.write_seq = seq;
     Ok(())
 }
 
-/// 发布线程主循环，串行处理写入请求与关闭请求。
-fn publisher_loop(
-    shm_name: String,
-    rx: Receiver<PublisherCommand>,
-    init_ack: Sender<Result<(), String>>,
-) {
-    let publisher_instance_id = new_client_instance_id(CLIENT_ROLE_PUBLISHER);
-    let (mut shmem, publisher_client) = match create_shmem(&shm_name, publisher_instance_id) {
-        Ok(pair) => pair,
-        Err(err) => {
-            let _ = init_ack.send(Err(err));
-            return;
-        }
-    };
+/// 发布映射只有本进程 Mutex 的持有者能够访问，跨进程写入另有头部原子锁。
+struct PublisherMapping {
+    shmem: Shmem,
+    client: ShmemClientRegistration,
+    write_seq: u64,
+}
 
-    let mut write_seq = match shmem_slice(&shmem).and_then(|buf| {
-        load_u64_atomic(buf, H_WRITE_SEQ, Ordering::Acquire)
-            .map_err(|e| format!("读取初始写指针失败: {e}"))
-    }) {
-        Ok(seq) => seq,
-        Err(err) => {
-            let _ = init_ack.send(Err(err));
-            return;
-        }
-    };
+// SAFETY: 审核 shared_memory 0.12.4 的 Windows/Linux 实现：映射地址、文件描述符及
+// 内核句柄属于进程，不绑定创建线程；无 TLS/线程回调。唯一持有的 Shmem 从不裸露给
+// Python 或锁外使用，只通过 Mutex<Option<PublisherMapping>> 独占访问/析构。
+// 仅声明 Send，不声明 Sync；不允许裸 Shmem 被并发访问。非 Windows/Linux 不作此承诺。
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+unsafe impl Send for PublisherMapping {}
 
-    let _ = init_ack.send(Ok(()));
+type PublisherMappingSlot = Arc<Mutex<Option<PublisherMapping>>>;
 
+/// 后台线程只负责空闲保活，不参与逐条发布或确认往返。
+fn publisher_heartbeat(mapping: PublisherMappingSlot, stop: Receiver<()>) {
     loop {
-        match rx.recv_timeout(Duration::from_millis(SHM_HEARTBEAT_INTERVAL_MS)) {
-            Ok(PublisherCommand::Publish { payload, ack }) => {
-                let result = write_payload_to_shmem(&mut shmem, &publisher_client, &mut write_seq, &payload);
-                let _ = ack.send(result);
-            }
-
-            Ok(PublisherCommand::Close { ack }) => {
-                let _ = ack.send(());
-                break;
-            }
-
+        match stop.recv_timeout(Duration::from_millis(SHM_HEARTBEAT_INTERVAL_MS)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Err(err) = update_client_heartbeat(&mut shmem, &publisher_client) {
+                let Ok(mut slot) = mapping.lock() else { break; };
+                let Some(opened) = slot.as_mut() else { break; };
+                if let Err(err) = update_client_heartbeat(&mut opened.shmem, &opened.client) {
                     error!("[MmapPublisher] 更新 heartbeat 失败: {err}");
                 }
             }
-
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                break;
-            }
         }
     }
-
-    if let Err(err) = release_client_ref(&mut shmem, &publisher_client) {
-        error!("[MmapPublisher] 释放共享内存发布端 client 槽位失败: {err}");
-    }
-
-    // 不在正常关闭时 unlink。
-    //
-    // 原因：
-    // 1. 可能还有其它发布端/订阅端正在使用同名共享内存。
-    // 2. drop 后再 unlink 存在误删后来者的竞态。
-    // 3. 新发布端启动时会通过 client table + heartbeat 清理崩溃遗留并在必要时重置 header。
-    drop(shmem);
 }
 
-/// 共享内存发布器的线程安全核心实现。
+/// 单条同步直接写入，去掉每条 mpsc 命令/确认通道/线程唤醒。
 struct PublisherInner {
     shm_name: String,
-    tx: Mutex<Option<Sender<PublisherCommand>>>,
+    codec: PickleCodec,
+    mapping: PublisherMappingSlot,
+    wake: Arc<LocalWake>,
+    heartbeat_stop: Sender<()>,
     worker: Mutex<Option<JoinHandle<()>>>,
     closed: AtomicBool,
 }
 
 impl PublisherInner {
-    fn new(shm_name: &str) -> PyResult<Self> {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<PublisherCommand>();
-        let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
-        let shm_name_string = shm_name.to_string();
-        let thread_name = format!("MmapPublisher-{}", shm_name_string);
-
-        let worker = thread::Builder::new()
-            .name(thread_name)
-            .spawn({
-                let shm_name = shm_name_string.clone();
-                move || publisher_loop(shm_name, cmd_rx, init_tx)
-            })
-            .map_err(|e| PyRuntimeError::new_err(format!("启动共享内存发布线程失败: {e}")))?;
-
-        match init_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                shm_name: shm_name_string,
-                tx: Mutex::new(Some(cmd_tx)),
-                worker: Mutex::new(Some(worker)),
-                closed: AtomicBool::new(false),
-            }),
-            Ok(Err(err)) => {
-                let _ = join_handle(worker, "MmapPublisherInit");
-                Err(PyIOError::new_err(format!(
-                    "创建共享内存 '{shm_name}' 失败: {err}"
-                )))
-            }
+    fn new(py: Python<'_>, shm_name: &str) -> PyResult<Self> {
+        let codec = PickleCodec::new(py)?;
+        let (shmem, client) = create_shmem(shm_name, new_client_instance_id(CLIENT_ROLE_PUBLISHER))
+            .map_err(|err| PyIOError::new_err(format!("创建共享内存 '{shm_name}' 失败: {err}")))?;
+        let mapping = Arc::new(Mutex::new(Some(PublisherMapping { shmem, client, write_seq: 0 })));
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let shared = Arc::clone(&mapping);
+        let worker = match thread::Builder::new()
+            .name(format!("MmapPublisherHeartbeat-{shm_name}"))
+            .spawn(move || publisher_heartbeat(shared, stop_rx))
+        {
+            Ok(worker) => worker,
             Err(err) => {
-                let _ = join_handle(worker, "MmapPublisherInit");
-                Err(PyRuntimeError::new_err(format!(
-                    "等待共享内存发布线程初始化失败: {err}"
-                )))
+                if let Ok(mut slot) = mapping.lock() {
+                    if let Some(mut opened) = slot.take() {
+                        let _ = release_client_ref(&mut opened.shmem, &opened.client);
+                    }
+                }
+                return Err(PyRuntimeError::new_err(format!("启动共享内存心跳线程失败: {err}")));
             }
-        }
+        };
+        let wake = local_wake(shm_name);
+        wake.publishers.fetch_add(1, Ordering::AcqRel);
+        Ok(Self {
+            shm_name: shm_name.to_owned(), codec, mapping, wake, heartbeat_stop: stop_tx,
+            worker: Mutex::new(Some(worker)), closed: AtomicBool::new(false),
+        })
     }
 
     fn publish(&self, py: Python<'_>, event: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -1782,7 +1871,7 @@ impl PublisherInner {
             return Err(PyRuntimeError::new_err("共享内存发布器已关闭"));
         }
 
-        let payload = py_serialize(py, event)?;
+        let payload = self.codec.serialize(py, event)?;
         if payload.len() > MAX_PAYLOAD {
             return Err(PyValueError::new_err(format!(
                 "事件序列化后 {}B 超过 MAX_PAYLOAD={}B",
@@ -1791,28 +1880,47 @@ impl PublisherInner {
             )));
         }
 
-        let sender = {
-            let sender_guard = lock_mutex(&self.tx, "读取共享内存发布通道")?;
-            sender_guard.clone()
-        };
+        let mut slot = lock_mutex(&self.mapping, "读取共享内存发布映射")?;
+        let opened = slot.as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("共享内存发布器已关闭"))?;
+        write_payload_to_shmem(&mut opened.shmem, &opened.client, &mut opened.write_seq, &payload)
+            .map_err(|err| PyRuntimeError::new_err(format!("发布事件失败: {err}")))?;
+        drop(slot);
+        self.wake.notify();
+        Ok(())
+    }
 
-        let sender = match sender {
-            Some(sender) => sender,
-            None => return Err(PyRuntimeError::new_err("共享内存发布通道已关闭")),
-        };
-
-        let (ack_tx, ack_rx) = mpsc::channel::<Result<(), String>>();
-        sender
-            .send(PublisherCommand::Publish {
-                payload,
-                ack: ack_tx,
-            })
-            .map_err(|e| PyRuntimeError::new_err(format!("发送发布命令失败: {e}")))?;
-
-        ack_rx
-            .recv()
-            .map_err(|e| PyRuntimeError::new_err(format!("等待发布确认失败: {e}")))?
-            .map_err(|e| PyRuntimeError::new_err(format!("发布事件失败: {e}")))
+    fn publish_many(&self, py: Python<'_>, events: &Bound<'_, PyAny>) -> PyResult<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(PyRuntimeError::new_err("共享内存发布器已关闭"));
+        }
+        let mut payloads = Vec::new();
+        for event in events.try_iter()? {
+            if payloads.len() == MAX_PUBLISH_BATCH {
+                return Err(PyValueError::new_err(format!(
+                    "单批事件数量超过 MAX_PUBLISH_BATCH={MAX_PUBLISH_BATCH}"
+                )));
+            }
+            let payload = self.codec.serialize(py, &event?)?;
+            if payload.len() > MAX_PAYLOAD {
+                return Err(PyValueError::new_err(format!(
+                    "事件序列化后 {}B 超过 MAX_PAYLOAD={}B", payload.len(), MAX_PAYLOAD
+                )));
+            }
+            payloads.push(payload);
+        }
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        // Python 迭代和序列化全部完成后才持锁，锁内绝不调用 Python。
+        let mut slot = lock_mutex(&self.mapping, "读取共享内存发布映射")?;
+        let opened = slot.as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("共享内存发布器已关闭"))?;
+        write_batch_to_shmem(opened, &payloads)
+            .map_err(|err| PyRuntimeError::new_err(format!("批量发布事件失败: {err}")))?;
+        drop(slot);
+        self.wake.notify();
+        Ok(())
     }
 
     fn close(&self) -> PyResult<()> {
@@ -1822,18 +1930,15 @@ impl PublisherInner {
 
         let mut first_error: Option<PyErr> = None;
 
-        let sender = {
-            let mut sender_guard = lock_mutex(&self.tx, "关闭共享内存发布通道")?;
-            sender_guard.take()
-        };
-
-        if let Some(sender) = sender {
-            let (ack_tx, ack_rx) = mpsc::channel::<()>();
-            if let Err(e) = sender.send(PublisherCommand::Close { ack: ack_tx }) {
-                first_error = Some(PyRuntimeError::new_err(format!("发送关闭命令失败: {e}")));
-            } else if let Err(e) = ack_rx.recv() {
-                first_error = Some(PyRuntimeError::new_err(format!("等待关闭确认失败: {e}")));
+        self.wake.publishers.fetch_sub(1, Ordering::AcqRel);
+        self.wake.notify();
+        let _ = self.heartbeat_stop.send(());
+        // take 与正在进行的同步写入串行，映射只能在最后一笔写入结束后析构。
+        if let Some(mut opened) = lock_mutex(&self.mapping, "关闭共享内存发布映射")?.take() {
+            if let Err(err) = release_client_ref(&mut opened.shmem, &opened.client) {
+                first_error = Some(PyRuntimeError::new_err(format!("释放发布端 client 槽位失败: {err}")));
             }
+            // 保持非 owner，不 unlink 其它发布端/订阅端使用的命名对象。
         }
 
         let handle = {
@@ -1859,6 +1964,13 @@ impl PublisherInner {
     }
 }
 
+impl Drop for PublisherInner {
+    fn drop(&mut self) {
+        // 最后一个 Arc 被释放时也关闭心跳，避免未显式 close 的实例泄漏保活线程。
+        if let Err(err) = self.close() { error!("[MmapPublisher] 自动关闭失败: {err}"); }
+    }
+}
+
 /// 基于共享内存的跨进程事件发布器。
 ///
 /// 该对象会将 Python 事件序列化后写入共享内存环形缓冲区，适合广播高频市场事件。
@@ -1869,19 +1981,27 @@ pub struct MmapPublisher {
 
 #[pymethods]
 impl MmapPublisher {
-    /// 创建发布器并启动后台写线程。
+    /// 创建同步发布器并启动独立空闲心跳线程。
     #[new]
     #[pyo3(signature = (shm_name = "vnpy_evbus"))]
-    fn new(shm_name: &str) -> PyResult<Self> {
+    fn new(py: Python<'_>, shm_name: &str) -> PyResult<Self> {
         init_error_logger();
         Ok(Self {
-            inner: Arc::new(PublisherInner::new(shm_name)?),
+            inner: Arc::new(PublisherInner::new(py, shm_name)?),
         })
     }
 
     /// 发布一个可被 `pickle` 序列化的 Python 事件对象。
     fn publish(&self, py: Python<'_>, event: &Bound<'_, PyAny>) -> PyResult<()> {
         self.inner.publish(py, event)
+    }
+
+    /// 顺序发布至多 MAX_PUBLISH_BATCH 条事件，共享一次写锁与心跳更新。
+    ///
+    /// 空迭代器不写入；输入全部序列化和校验后才发送。成功返回表示整批已写入，
+    /// 不是消费者已收到。底层写入故障仍可能发生部分发布，不提供事务回滚。
+    fn publish_many(&self, py: Python<'_>, events: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.inner.publish_many(py, events)
     }
 
     /// 关闭发布器并等待后台线程安全退出。
@@ -2134,6 +2254,7 @@ struct EngineState {
 /// 事件引擎的线程安全核心实现。
 struct EventEngineInner {
     interval: u64,
+    codec: Arc<PickleCodec>,
     channel: Mutex<String>,
     active: Arc<AtomicBool>,
     handlers: SharedHandlerMap,
@@ -2142,13 +2263,14 @@ struct EventEngineInner {
 }
 
 impl EventEngineInner {
-    fn new(interval: u64) -> Self {
+    fn new(interval: u64, codec: PickleCodec) -> Self {
         Self {
             interval,
+            codec: Arc::new(codec),
             channel: Mutex::new(String::new()),
             active: Arc::new(AtomicBool::new(false)),
             handlers: Arc::new(Mutex::new(HashMap::new())),
-            general_handlers: Arc::new(Mutex::new(Vec::new())),
+            general_handlers: Arc::new(Mutex::new(Arc::default())),
             state: Mutex::new(EngineState {
                 event_tx: None,
                 publisher: None,
@@ -2182,7 +2304,7 @@ impl EventEngineInner {
         }
 
         if let Some(tx) = self.clone_sender()? {
-            tx.send(raw)
+            tx.send(EventPacket::Single(raw))
                 .map_err(|e| PyRuntimeError::new_err(format!("发送事件到本地队列失败: {e}")))?;
         }
         Ok(())
@@ -2274,14 +2396,14 @@ impl EventEngine {
     /// `interval` 表示定时器事件的触发周期，单位为秒。
     #[new]
     #[pyo3(signature = (interval = 1))]
-    fn new(interval: u64) -> PyResult<Self> {
+    fn new(py: Python<'_>, interval: u64) -> PyResult<Self> {
         if interval == 0 {
             return Err(PyValueError::new_err("interval 必须大于 0 秒"));
         }
 
         init_error_logger();
         Ok(Self {
-            inner: Arc::new(EventEngineInner::new(interval)),
+            inner: Arc::new(EventEngineInner::new(interval, PickleCodec::new(py)?)),
         })
     }
 
@@ -2305,12 +2427,13 @@ impl EventEngine {
             return Ok(());
         }
 
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let (tx, rx) = mpsc::channel::<EventPacket>();
         let process_thread = match spawn_process_thread(
             rx,
             Arc::clone(&self.inner.active),
             Arc::clone(&self.inner.handlers),
             Arc::clone(&self.inner.general_handlers),
+            Arc::clone(&self.inner.codec),
         ) {
             Ok(handle) => handle,
             Err(err) => {
@@ -2323,6 +2446,7 @@ impl EventEngine {
             self.inner.interval,
             Arc::clone(&self.inner.active),
             tx.clone(),
+            Arc::clone(&self.inner.codec),
         ) {
             Ok(handle) => handle,
             Err(err) => {
@@ -2396,7 +2520,7 @@ impl EventEngine {
 
     /// 将事件直接写入本地处理队列，而不经过共享内存广播。
     fn event_to_queue(&self, py: Python<'_>, event: &Bound<'_, PyAny>) -> PyResult<()> {
-        let raw = py_serialize(py, event)?;
+        let raw = self.inner.codec.serialize(py, event)?;
         self.inner.event_to_queue_raw(raw)
     }
 
@@ -2452,7 +2576,9 @@ impl EventEngine {
             .iter()
             .any(|existing| is_same_handler(existing.bind(py), handler.bind(py)))
         {
-            handlers.push(handler);
+            let mut next = copy_handlers(py, handlers);
+            next.push(handler);
+            *handlers = Arc::new(next);
         }
         Ok(())
     }
@@ -2461,7 +2587,9 @@ impl EventEngine {
     fn unregister(&self, py: Python<'_>, type_: String, handler: Py<PyAny>) -> PyResult<()> {
         let mut map = lock_mutex(&self.inner.handlers, "注销事件处理器")?;
         if let Some(handlers) = map.get_mut(&type_) {
-            handlers.retain(|existing| !is_same_handler(existing.bind(py), handler.bind(py)));
+            *handlers = Arc::new(handlers.iter()
+                .filter(|existing| !is_same_handler(existing.bind(py), handler.bind(py)))
+                .map(|existing| existing.clone_ref(py)).collect());
             if handlers.is_empty() {
                 map.remove(&type_);
             }
@@ -2477,7 +2605,9 @@ impl EventEngine {
             .iter()
             .any(|existing| is_same_handler(existing.bind(py), handler.bind(py)))
         {
-            handlers.push(handler);
+            let mut next = copy_handlers(py, &handlers);
+            next.push(handler);
+            *handlers = Arc::new(next);
         }
         Ok(())
     }
@@ -2485,7 +2615,9 @@ impl EventEngine {
     /// 注销通用处理器。
     fn unregister_general(&self, py: Python<'_>, handler: Py<PyAny>) -> PyResult<()> {
         let mut handlers = lock_mutex(&self.inner.general_handlers, "注销通用处理器")?;
-        handlers.retain(|existing| !is_same_handler(existing.bind(py), handler.bind(py)));
+        *handlers = Arc::new(handlers.iter()
+            .filter(|existing| !is_same_handler(existing.bind(py), handler.bind(py)))
+            .map(|existing| existing.clone_ref(py)).collect());
         Ok(())
     }
 
@@ -2526,31 +2658,49 @@ impl EventEngine {
 
 /// 启动本地事件处理线程，负责反序列化事件并调用注册处理器。
 fn spawn_process_thread(
-    rx: Receiver<Vec<u8>>,
+    rx: Receiver<EventPacket>,
     active: Arc<AtomicBool>,
     handlers: SharedHandlerMap,
     general_handlers: SharedHandlerVec,
+    codec: Arc<PickleCodec>,
 ) -> PyResult<JoinHandle<()>> {
     thread::Builder::new()
         .name("EventProcess".to_string())
         .spawn(move || {
-            for raw in rx {
-                if !active.load(Ordering::Acquire) {
-                    break;
+            let mut pending = VecDeque::with_capacity(SUBSCRIBER_BATCH_LIMIT);
+            while active.load(Ordering::Acquire) {
+                if pending.is_empty() {
+                    match rx.recv() {
+                        Ok(packet) => packet.append_to(&mut pending),
+                        Err(_) => break,
+                    }
                 }
-
-                if Python::try_attach(|py| match py_deserialize(py, &raw) {
-                    Ok(event) => {
-                        if active.load(Ordering::Acquire) {
-                            dispatch_event_isolated(py, &event, &handlers, &general_handlers);
+                if Python::try_attach(|py| {
+                    let started = Instant::now();
+                    for index in 0..PROCESS_BATCH_LIMIT {
+                        if !active.load(Ordering::Acquire) { break; }
+                        let Some(raw) = pending.pop_front() else { break; };
+                        match codec.deserialize(py, &raw) {
+                            Ok(event) => {
+                                if active.load(Ordering::Acquire) {
+                                    dispatch_event_isolated(py, &event, &handlers, &general_handlers);
+                                }
+                            }
+                            Err(err) => error!("[EventEngine] 反序列化事件失败: {err}"),
+                        }
+                        if !active.load(Ordering::Acquire)
+                            || index + 1 == PROCESS_BATCH_LIMIT
+                            || started.elapsed() >= PROCESS_GIL_BUDGET
+                        { break; }
+                        if pending.is_empty() {
+                            match rx.try_recv() {
+                                Ok(packet) => packet.append_to(&mut pending),
+                                Err(_) => break,
+                            }
                         }
                     }
-                    Err(err) => error!("[EventEngine] 反序列化事件失败: {err}"),
-                })
-                .is_none()
-                {
-                    break;
-                }
+                }).is_none() { break; }
+                // 超出本次预算的同批消息保留在 pending，下次继续，不能丢弃。
             }
         })
         .map_err(|e| PyRuntimeError::new_err(format!("启动事件处理线程失败: {e}")))
@@ -2561,6 +2711,7 @@ fn spawn_timer_thread(
     interval: u64,
     active: Arc<AtomicBool>,
     tx: EventSender,
+    codec: Arc<PickleCodec>,
 ) -> PyResult<JoinHandle<()>> {
     thread::Builder::new()
         .name("EventTimer".to_string())
@@ -2579,14 +2730,14 @@ fn spawn_timer_thread(
                         .map_err(|e| {
                             PyRuntimeError::new_err(format!("获取 datetime.now() 失败: {e}"))
                         })?;
-                    serialize_event_from_parts(py, EVENT_TIMER, now.unbind())
+                    serialize_event_from_parts(py, &codec, EVENT_TIMER, now.unbind())
                 }) else {
                     break;
                 };
 
                 match result {
                     Ok(raw) => {
-                        if tx.send(raw).is_err() {
+                        if tx.send(EventPacket::Single(raw)).is_err() {
                             break;
                         }
                     }
@@ -2626,5 +2777,6 @@ fn rust_event_engine(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<
     module.add("EVENT_TICK", EVENT_TICK)?;
     module.add("NUM_SLOTS", NUM_SLOTS)?;
     module.add("MAX_PAYLOAD", MAX_PAYLOAD)?;
+    module.add("MAX_PUBLISH_BATCH", MAX_PUBLISH_BATCH)?;
     Ok(())
 }
