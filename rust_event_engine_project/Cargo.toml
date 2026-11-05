@@ -8,11 +8,11 @@ name = "rust_event_engine"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.28.3", features = ["extension-module"] }
+pyo3 = { version = "0.30.1", features = ["extension-module"] }
 shared_memory = "0.12.4"
-libc = "0.2.186"
-log = "0.4.29"
-env_logger = "0.11.10"
+libc = "0.2.190"
+log = "0.4.34"
+env_logger = "0.11.11"
 
 [profile.release]
 opt-level = 3
